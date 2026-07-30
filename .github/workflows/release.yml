@@ -1,0 +1,184 @@
+# Build platform binaries and publish/update a GitHub Release that
+# grok's installer=gh-release can consume.
+#
+# Asset naming (required by xai-grok-update):
+#   grok-{version}-{os}-{arch}
+#   e.g. grok-0.2.114-macos-aarch64
+# Tag: v{version}  (e.g. v0.2.114)
+name: Release
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - "crates/codegen/xai-grok-pager-bin/Cargo.toml"
+      - "patches/**"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Skip if the triggering Sync upstream run failed
+  guard:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
+            crates/codegen/xai-grok-pager-bin/Cargo.toml | head -1)
+          if [[ -z "$VERSION" ]]; then
+            echo "Could not read version from pager-bin Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building release for v$VERSION"
+
+  build:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: macos-aarch64
+          - os: ubuntu-22.04
+            artifact: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.artifact }}
+          cache-on-failure: true
+
+      - name: Build release binary
+        env:
+          PROTOC: ${{ runner.os == 'macOS' && '/opt/homebrew/bin/protoc' || '/usr/bin/protoc' }}
+        run: |
+          set -euo pipefail
+          # Prefer brew protoc on mac if present
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            export PROTOC="$(brew --prefix protobuf)/bin/protoc"
+          fi
+          cargo build -p xai-grok-pager-bin --release
+          BIN=target/release/xai-grok-pager
+          test -x "$BIN"
+          OUT="grok-${{ needs.guard.outputs.version }}-${{ matrix.artifact }}"
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT"
+          ls -lh "$OUT"
+          ./"$OUT" --version || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-${{ matrix.artifact }}
+          path: grok-${{ needs.guard.outputs.version }}-${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List dist
+        run: ls -lah dist/
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ASSETS=(dist/grok-*)
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "No assets in dist/"
+            exit 1
+          fi
+
+          NOTES="## Grok Build ${TAG} (binaricat fork)
+
+          - Upstream-synced build with **terminal** theme (transparent / follow terminal colors)
+          - \`GH_RELEASE_REPO\` points at \`binaricat/grok-build\` so \`installer = \"gh-release\"\` updates stay on this fork
+
+          ### Install
+
+          \`\`\`bash
+          gh release download ${TAG} --repo binaricat/grok-build \\
+            --pattern \"grok-${VERSION}-*\" -D ~/.grok/downloads
+          chmod +x ~/.grok/downloads/grok-${VERSION}-*
+          ln -sfn ../downloads/grok-${VERSION}-macos-aarch64 ~/.grok/bin/grok   # adjust platform
+          \`\`\`
+
+          Or with this build installed once:
+
+          \`\`\`toml
+          # ~/.grok/config.toml
+          [cli]
+          installer = \"gh-release\"
+          auto_update = true
+
+          [ui]
+          theme = \"terminal\"
+          \`\`\`
+
+          Commit: ${{ github.sha }}
+          "
+
+          if gh release view "$TAG" --repo binaricat/grok-build >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating assets"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo binaricat/grok-build
+            gh release edit "$TAG" --notes "$NOTES" --repo binaricat/grok-build
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "Grok Build $TAG (terminal theme)" \
+              --notes "$NOTES" \
+              --repo binaricat/grok-build
+          fi
+
+          gh release view "$TAG" --repo binaricat/grok-build
