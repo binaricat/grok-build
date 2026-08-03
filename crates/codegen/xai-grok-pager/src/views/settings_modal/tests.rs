@@ -7105,6 +7105,7 @@ fn max_thoughts_width_preview_title_styling_distinguishes_from_content() {
         // because `theme::oscura` is a private module.
         crate::theme::ThemeKind::OscuraMidnight => crate::theme::Theme::current(),
         crate::theme::ThemeKind::Auto => crate::theme::Theme::groknight(),
+        crate::theme::ThemeKind::Terminal => crate::theme::Theme::terminal_default(),
     };
     assert_ne!(
         raw_theme.bg_visual, raw_theme.bg_highlight,
