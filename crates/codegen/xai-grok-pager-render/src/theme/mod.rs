@@ -42,6 +42,12 @@ pub enum ThemeKind {
     /// only the resolved concrete kind lives in the cache.
     /// Excluded from [`ALL`] and [`available()`].
     Auto = 4,
+    /// Follow the host terminal's default fg/bg (transparent canvas).
+    ///
+    /// Backgrounds use [`Color::Reset`] so the terminal profile/wallpaper
+    /// shows through; accents stay on the ANSI-16 palette. Same palette as
+    /// minimal mode's terminal-native theme, but selectable in the full TUI.
+    Terminal = 6,
 }
 
 impl ThemeKind {
@@ -52,6 +58,7 @@ impl ThemeKind {
         ThemeKind::TokyoNight,
         ThemeKind::RosePineMoon,
         ThemeKind::OscuraMidnight,
+        ThemeKind::Terminal,
     ];
 
     /// Theme kinds available on the current terminal.
@@ -62,7 +69,11 @@ impl ThemeKind {
         // Two possible results — pick the right const slice based on
         // the detected color level. No heap allocation needed.
         const ALL: &[ThemeKind] = ThemeKind::ALL;
-        const NO_TRUECOLOR: &[ThemeKind] = &[ThemeKind::GrokNight, ThemeKind::GrokDay];
+        const NO_TRUECOLOR: &[ThemeKind] = &[
+            ThemeKind::GrokNight,
+            ThemeKind::GrokDay,
+            ThemeKind::Terminal,
+        ];
 
         if color_support::detect().has_truecolor() {
             ALL
@@ -80,6 +91,7 @@ impl ThemeKind {
             Self::RosePineMoon => "rosepine-moon",
             Self::OscuraMidnight => "oscura-midnight",
             Self::Auto => "auto",
+            Self::Terminal => "terminal",
         }
     }
 
@@ -97,6 +109,8 @@ impl ThemeKind {
             Self::OscuraMidnight => true,
             // Auto is resolved to a concrete theme before rendering.
             Self::Auto => false,
+            // ANSI-16 + Reset only — works on every color terminal.
+            Self::Terminal => false,
         }
     }
 
@@ -113,6 +127,9 @@ impl ThemeKind {
                 Some(Self::RosePineMoon)
             }
             "oscura" | "oscura-midnight" => Some(Self::OscuraMidnight),
+            "terminal" | "native" | "inherit" | "follow-terminal" | "transparent" => {
+                Some(Self::Terminal)
+            }
             _ => None,
         }
     }
@@ -121,6 +138,12 @@ impl ThemeKind {
     #[must_use]
     pub fn is_auto(self) -> bool {
         self == Self::Auto
+    }
+
+    /// Whether this is the terminal-native (transparent canvas) theme.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        self == Self::Terminal
     }
 }
 
@@ -148,6 +171,7 @@ pub fn display_name_for_canonical(value: &str) -> &str {
         "grokday" => "Grok Day",
         "tokyonight" => "Tokyo Night",
         "rosepine-moon" => "Rose Pine Moon",
+        "terminal" => "Terminal",
         other => other,
     }
 }
@@ -268,12 +292,19 @@ impl Theme {
         if cache::terminal_native_locked() {
             return Self::terminal_default().quantized(level);
         }
+        // Full-TUI "terminal" theme: transparent canvas + ANSI accents.
+        // Skip windows contrast boost / ANSI16 chrome overrides — those
+        // paint opaque Black/White and would defeat Color::Reset.
+        if cache::current_kind() == ThemeKind::Terminal {
+            return Self::terminal_default().quantized(level);
+        }
         let base = match cache::current_kind() {
             ThemeKind::GrokNight => Self::groknight(),
             ThemeKind::TokyoNight => Self::tokyonight(),
             ThemeKind::GrokDay => Self::grokday(),
             ThemeKind::RosePineMoon => Self::rosepine_moon(),
             ThemeKind::OscuraMidnight => Self::oscura_midnight(),
+            ThemeKind::Terminal => Self::terminal_default(),
             // Auto is resolved to a concrete theme before being stored;
             // if reached, fall back to GrokNight.
             ThemeKind::Auto => Self::groknight(),
@@ -706,6 +737,44 @@ mod tests {
         assert!(!ThemeKind::TokyoNight.is_auto());
         assert!(!ThemeKind::RosePineMoon.is_auto());
         assert!(!ThemeKind::OscuraMidnight.is_auto());
+        assert!(!ThemeKind::Terminal.is_auto());
+    }
+
+    #[test]
+    fn from_name_terminal_aliases() {
+        for name in [
+            "terminal",
+            "native",
+            "inherit",
+            "follow-terminal",
+            "transparent",
+            "TERMINAL",
+        ] {
+            assert_eq!(
+                ThemeKind::from_name(name),
+                Some(ThemeKind::Terminal),
+                "{name}"
+            );
+        }
+        assert_eq!(ThemeKind::Terminal.display_name(), "terminal");
+        assert!(ThemeKind::Terminal.is_terminal());
+        assert!(!ThemeKind::Terminal.requires_truecolor());
+        assert!(ThemeKind::ALL.contains(&ThemeKind::Terminal));
+    }
+
+    #[test]
+    fn terminal_theme_current_is_transparent() {
+        use ratatui::style::Color;
+        let _guard = cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache::reset_for_test();
+        cache::set(ThemeKind::Terminal);
+        let theme = Theme::current();
+        assert_eq!(theme.bg_base, Color::Reset);
+        assert_eq!(theme.bg_terminal, Color::Reset);
+        assert_eq!(Theme::current_kind(), ThemeKind::Terminal);
+        cache::reset_for_test();
     }
 
     #[test]
@@ -1063,6 +1132,9 @@ mod tests {
                 ThemeKind::TokyoNight => Theme::tokyonight(),
                 ThemeKind::RosePineMoon => Theme::rosepine_moon(),
                 ThemeKind::OscuraMidnight => Theme::oscura_midnight(),
+                // Terminal theme defers scrollbar colors to the host canvas;
+                // there is no RGB contrast contract to enforce here.
+                ThemeKind::Terminal => continue,
                 ThemeKind::Auto => unreachable!("ALL excludes Auto"),
             };
             let track = lum(theme.scrollbar_bg, "scrollbar_bg", kind);
@@ -1234,6 +1306,11 @@ mod tests {
             ("rose-pine", ThemeKind::RosePineMoon),
             ("rosepine-moon", ThemeKind::RosePineMoon),
             ("rose-pine-moon", ThemeKind::RosePineMoon),
+            ("terminal", ThemeKind::Terminal),
+            ("native", ThemeKind::Terminal),
+            ("inherit", ThemeKind::Terminal),
+            ("follow-terminal", ThemeKind::Terminal),
+            ("transparent", ThemeKind::Terminal),
         ];
         for (name, expected) in cases {
             assert_eq!(
