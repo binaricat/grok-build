@@ -1,0 +1,139 @@
+# Hard-sync xai-org/grok-build main, re-apply the terminal-theme overlay,
+# then force-push. Overlay files (patches/ + .github/ + FORK.md) survive the reset.
+#
+# If patches/terminal-theme.patch no longer applies, the job fails loudly so
+# you can rebase the patch locally (see FORK.md). No automatic conflict resolve.
+name: Sync upstream
+
+on:
+  schedule:
+    # Every 6 hours
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Full history so we can reset and force-push cleanly
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/xai-org/grok-build.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/xai-org/grok-build.git
+          git fetch upstream main
+          echo "upstream=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+          echo "current=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Skip if already current
+        id: skip
+        run: |
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [[ -f .upstream-sha ]]; then
+            LAST=$(cat .upstream-sha)
+          else
+            LAST=""
+          fi
+          if [[ "$LAST" == "$UPSTREAM" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced to $UPSTREAM"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Need sync: last=$LAST upstream=$UPSTREAM"
+          fi
+
+      - name: Preserve overlay and re-apply
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          OVERLAY=$(mktemp -d)
+          # Keep our maintenance layer off the upstream tree
+          for path in patches .github FORK.md; do
+            if [[ -e "$path" ]]; then
+              cp -a "$path" "$OVERLAY/"
+            fi
+          done
+
+          git reset --hard upstream/main
+          git clean -fdx -e target
+
+          # Restore overlay
+          if [[ -d "$OVERLAY/patches" ]]; then cp -a "$OVERLAY/patches" .; fi
+          if [[ -d "$OVERLAY/.github" ]]; then cp -a "$OVERLAY/.github" .; fi
+          if [[ -f "$OVERLAY/FORK.md" ]]; then cp -a "$OVERLAY/FORK.md" .; fi
+
+          if [[ ! -f patches/terminal-theme.patch ]]; then
+            echo "::error::patches/terminal-theme.patch missing after overlay restore"
+            exit 1
+          fi
+
+          if ! git apply --index patches/terminal-theme.patch; then
+            {
+              echo "## Patch apply failed"
+              echo ""
+              echo "\`patches/terminal-theme.patch\` no longer applies cleanly to"
+              echo "\`xai-org/grok-build@${upstream}\`."
+              echo ""
+              echo "### Fix locally"
+              echo '```bash'
+              echo "git fetch upstream && git reset --hard upstream/main"
+              echo "git apply --reject patches/terminal-theme.patch"
+              echo "# fix *.rej, then:"
+              echo "git add -A && git diff --cached > patches/terminal-theme.patch"
+              echo "git add patches/terminal-theme.patch && git commit -m 'chore: refresh terminal-theme patch'"
+              echo "git push origin HEAD:main"
+              echo "gh workflow run sync-upstream.yml --repo binaricat/grok-build"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::terminal-theme.patch failed to apply against upstream main — rebase the patch locally (see job summary / FORK.md)"
+            git apply --reject --whitespace=nowarn patches/terminal-theme.patch || true
+            echo "---- reject files ----"
+            find . -name '*.rej' -print | while read -r f; do
+              echo "===== $f ====="
+              head -80 "$f" || true
+            done
+            exit 1
+          fi
+
+          git rev-parse upstream/main > .upstream-sha
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit (unexpected — upstream tree + overlay identical?)"
+            exit 0
+          fi
+
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
+          git commit -m "sync upstream ${UPSTREAM_SHORT} + terminal theme
+
+          Source: xai-org/grok-build@${UPSTREAM_SHORT}
+          Overlay: patches/terminal-theme.patch (terminal theme + gh-release repo)"
+
+          # History is rewritten onto upstream/main; force-with-lease is required.
+          git push --force-with-lease origin HEAD:main
+
+      - name: Trigger release build
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml --ref main || true
