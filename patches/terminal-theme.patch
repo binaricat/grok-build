@@ -1,0 +1,309 @@
+diff --git a/crates/codegen/xai-grok-pager-render/src/syntax.rs b/crates/codegen/xai-grok-pager-render/src/syntax.rs
+index 3551ff97..a0c82bdc 100644
+--- a/crates/codegen/xai-grok-pager-render/src/syntax.rs
++++ b/crates/codegen/xai-grok-pager-render/src/syntax.rs
+@@ -130,7 +130,10 @@ pub fn get_syntect() -> &'static Syntect {
+         ThemeKind::GrokNight
+         | ThemeKind::RosePineMoon
+         | ThemeKind::OscuraMidnight
+-        | ThemeKind::Auto => SYNTECT_GROKNIGHT
++        | ThemeKind::Auto
++        // Terminal theme keeps the night tmTheme; near-gray tokens are
++        // remapped to Reset in syntect_to_ratatui_fg (polarity-safe).
++        | ThemeKind::Terminal => SYNTECT_GROKNIGHT
+             .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-night.tmTheme"))),
+         ThemeKind::TokyoNight => SYNTECT_TOKYONIGHT
+             .get_or_init(|| Syntect::new(include_bytes!("../assets/tokyo-night.tmTheme"))),
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/cache.rs b/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
+index cb8a9b07..a54ec7b9 100644
+--- a/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
++++ b/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
+@@ -37,6 +37,7 @@ fn theme_kind_from_u8(byte: u8) -> ThemeKind {
+         x if x == ThemeKind::RosePineMoon as u8 => ThemeKind::RosePineMoon,
+         x if x == ThemeKind::OscuraMidnight as u8 => ThemeKind::OscuraMidnight,
+         x if x == ThemeKind::Auto as u8 => ThemeKind::Auto,
++        x if x == ThemeKind::Terminal as u8 => ThemeKind::Terminal,
+         _ => ThemeKind::GrokNight,
+     }
+ }
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/mod.rs b/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
+index f97f71d4..a542adda 100644
+--- a/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
++++ b/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
+@@ -36,6 +36,12 @@ pub enum ThemeKind {
+     /// The `"auto"` string is stored on disk and in `app.current_ui.theme`, but only the resolved concrete kind lives in `cache::CURRENT`.
+     /// Excluded from [`ALL`] and [`available()`].
+     Auto = 4,
++    /// Follow the host terminal's default fg/bg (transparent canvas).
++    ///
++    /// Backgrounds use [`Color::Reset`] so the terminal profile/wallpaper
++    /// shows through; accents stay on the ANSI-16 palette. Same palette as
++    /// minimal mode's terminal-native theme, but selectable in the full TUI.
++    Terminal = 6,
+ }
+ 
+ impl ThemeKind {
+@@ -46,6 +52,7 @@ impl ThemeKind {
+         ThemeKind::TokyoNight,
+         ThemeKind::RosePineMoon,
+         ThemeKind::OscuraMidnight,
++        ThemeKind::Terminal,
+     ];
+ 
+     /// Theme kinds available on the current terminal.
+@@ -54,7 +61,11 @@ impl ThemeKind {
+     pub fn available() -> &'static [ThemeKind] {
+         // Pick the right const slice for the detected color level; no heap allocation needed
+         const ALL: &[ThemeKind] = ThemeKind::ALL;
+-        const NO_TRUECOLOR: &[ThemeKind] = &[ThemeKind::GrokNight, ThemeKind::GrokDay];
++        const NO_TRUECOLOR: &[ThemeKind] = &[
++            ThemeKind::GrokNight,
++            ThemeKind::GrokDay,
++            ThemeKind::Terminal,
++        ];
+ 
+         if color_support::detect().has_truecolor() {
+             ALL
+@@ -71,6 +82,7 @@ impl ThemeKind {
+             Self::RosePineMoon => "rosepine-moon",
+             Self::OscuraMidnight => "oscura-midnight",
+             Self::Auto => "auto",
++            Self::Terminal => "terminal",
+         }
+     }
+ 
+@@ -87,6 +99,8 @@ impl ThemeKind {
+             Self::OscuraMidnight => true,
+             // Auto is resolved to a concrete theme before rendering.
+             Self::Auto => false,
++            // ANSI-16 + Reset only — works on every color terminal.
++            Self::Terminal => false,
+         }
+     }
+ 
+@@ -103,6 +117,9 @@ impl ThemeKind {
+                 Some(Self::RosePineMoon)
+             }
+             "oscura" | "oscura-midnight" => Some(Self::OscuraMidnight),
++            "terminal" | "native" | "inherit" | "follow-terminal" | "transparent" => {
++                Some(Self::Terminal)
++            }
+             _ => None,
+         }
+     }
+@@ -112,6 +129,12 @@ impl ThemeKind {
+     pub fn is_auto(self) -> bool {
+         self == Self::Auto
+     }
++
++    /// Whether this is the terminal-native (transparent canvas) theme.
++    #[must_use]
++    pub fn is_terminal(self) -> bool {
++        self == Self::Terminal
++    }
+ }
+ 
+ /// `FromStr` wrapper around [`ThemeKind::from_name`].
+@@ -138,6 +161,7 @@ pub fn display_name_for_canonical(value: &str) -> &str {
+         "grokday" => "Grok Day",
+         "tokyonight" => "Tokyo Night",
+         "rosepine-moon" => "Rose Pine Moon",
++        "terminal" => "Terminal",
+         other => other,
+     }
+ }
+@@ -255,12 +279,19 @@ impl Theme {
+         if cache::terminal_native_locked() {
+             return Self::terminal_default().quantized(level);
+         }
++        // Full-TUI "terminal" theme: transparent canvas + ANSI accents.
++        // Skip windows contrast boost / ANSI16 chrome overrides — those
++        // paint opaque Black/White and would defeat Color::Reset.
++        if cache::current_kind() == ThemeKind::Terminal {
++            return Self::terminal_default().quantized(level);
++        }
+         let base = match cache::current_kind() {
+             ThemeKind::GrokNight => Self::groknight(),
+             ThemeKind::TokyoNight => Self::tokyonight(),
+             ThemeKind::GrokDay => Self::grokday(),
+             ThemeKind::RosePineMoon => Self::rosepine_moon(),
+             ThemeKind::OscuraMidnight => Self::oscura_midnight(),
++            ThemeKind::Terminal => Self::terminal_default(),
+             // Auto is resolved to a concrete theme before being stored; if reached, fall back to GrokNight
+             ThemeKind::Auto => Self::groknight(),
+         };
+@@ -623,6 +654,44 @@ mod tests {
+         assert!(!ThemeKind::TokyoNight.is_auto());
+         assert!(!ThemeKind::RosePineMoon.is_auto());
+         assert!(!ThemeKind::OscuraMidnight.is_auto());
++        assert!(!ThemeKind::Terminal.is_auto());
++    }
++
++    #[test]
++    fn from_name_terminal_aliases() {
++        for name in [
++            "terminal",
++            "native",
++            "inherit",
++            "follow-terminal",
++            "transparent",
++            "TERMINAL",
++        ] {
++            assert_eq!(
++                ThemeKind::from_name(name),
++                Some(ThemeKind::Terminal),
++                "{name}"
++            );
++        }
++        assert_eq!(ThemeKind::Terminal.display_name(), "terminal");
++        assert!(ThemeKind::Terminal.is_terminal());
++        assert!(!ThemeKind::Terminal.requires_truecolor());
++        assert!(ThemeKind::ALL.contains(&ThemeKind::Terminal));
++    }
++
++    #[test]
++    fn terminal_theme_current_is_transparent() {
++        use ratatui::style::Color;
++        let _guard = cache::test_lock()
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        cache::reset_for_test();
++        cache::set(ThemeKind::Terminal);
++        let theme = Theme::current();
++        assert_eq!(theme.bg_base, Color::Reset);
++        assert_eq!(theme.bg_terminal, Color::Reset);
++        assert_eq!(Theme::current_kind(), ThemeKind::Terminal);
++        cache::reset_for_test();
+     }
+ 
+     #[test]
+@@ -948,6 +1017,9 @@ mod tests {
+                 ThemeKind::TokyoNight => Theme::tokyonight(),
+                 ThemeKind::RosePineMoon => Theme::rosepine_moon(),
+                 ThemeKind::OscuraMidnight => Theme::oscura_midnight(),
++                // Terminal theme defers scrollbar colors to the host canvas;
++                // there is no RGB contrast contract to enforce here.
++                ThemeKind::Terminal => continue,
+                 ThemeKind::Auto => unreachable!("ALL excludes Auto"),
+             };
+             let track = lum(theme.scrollbar_bg, "scrollbar_bg", kind);
+@@ -1111,6 +1183,11 @@ mod tests {
+             ("rose-pine", ThemeKind::RosePineMoon),
+             ("rosepine-moon", ThemeKind::RosePineMoon),
+             ("rose-pine-moon", ThemeKind::RosePineMoon),
++            ("terminal", ThemeKind::Terminal),
++            ("native", ThemeKind::Terminal),
++            ("inherit", ThemeKind::Terminal),
++            ("follow-terminal", ThemeKind::Terminal),
++            ("transparent", ThemeKind::Terminal),
+         ];
+         for (name, expected) in cases {
+             assert_eq!(
+diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+index 9ed368f1..900f7066 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+@@ -67,6 +67,11 @@ const THEME_CHOICES: &[EnumChoice] = &[
+         display: "Oscura Midnight",
+         description: "Deep dark with warm accents; needs truecolor.",
+     },
++    EnumChoice {
++        canonical: "terminal",
++        display: "Terminal",
++        description: "Follow terminal colors; transparent background.",
++    },
+ ];
+ 
+ // ---------------------------------------------------------------------------
+@@ -496,6 +501,11 @@ const CONCRETE_THEME_CHOICES: &[EnumChoice] = &[
+         display: "Oscura Midnight",
+         description: "Deep dark with warm accents; needs truecolor.",
+     },
++    EnumChoice {
++        canonical: "terminal",
++        display: "Terminal",
++        description: "Follow terminal colors; transparent background.",
++    },
+ ];
+ 
+ /// Child settings shown inside the "Show contextual hints" group sub-sheet.
+diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
+index 1bc725de..76b50640 100644
+--- a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
++++ b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
+@@ -6480,6 +6480,7 @@ fn max_thoughts_width_preview_title_styling_distinguishes_from_content() {
+         // Resolved via `Theme::current()` rather than a constructor because `theme::oscura` is a private module
+         crate::theme::ThemeKind::OscuraMidnight => crate::theme::Theme::current(),
+         crate::theme::ThemeKind::Auto => crate::theme::Theme::groknight(),
++        crate::theme::ThemeKind::Terminal => crate::theme::Theme::terminal_default(),
+     };
+     assert_ne!(
+         raw_theme.bg_visual, raw_theme.bg_highlight,
+diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
+index 7a391e7e..f6429171 100644
+--- a/crates/codegen/xai-grok-update/src/auto_update.rs
++++ b/crates/codegen/xai-grok-update/src/auto_update.rs
+@@ -72,7 +72,10 @@ fn manual_install_cmd(channel: &str) -> String {
+ fn reinstall_hint(installer: &str, channel: &str) -> String {
+     match installer {
+         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
+-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
++        "gh-release" => format!(
++            "Please reinstall via GitHub Releases:\n  gh release download --repo {} --pattern 'grok-*' --output grok && chmod +x grok",
++            crate::version::GH_RELEASE_REPO
++        ),
+         _ => format!("Please reinstall via:\n  {}", manual_install_cmd(channel)),
+     }
+ }
+@@ -2352,7 +2355,7 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
+     Ok(())
+ }
+ 
+-/// Download and install grok from GitHub Releases (xai-org-shared/grok-build).
++/// Download and install grok from GitHub Releases ([`crate::version::GH_RELEASE_REPO`]).
+ ///
+ /// Uses `gh release download` to fetch the binary matching the current platform.
+ /// This works anywhere the `gh` CLI is authenticated, without needing npm or internal network access.
+diff --git a/crates/codegen/xai-grok-update/src/auto_update_tests.rs b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
+index 8b7c58cf..38ae4c63 100644
+--- a/crates/codegen/xai-grok-update/src/auto_update_tests.rs
++++ b/crates/codegen/xai-grok-update/src/auto_update_tests.rs
+@@ -934,7 +934,7 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
+         "should suggest gh release download: {hint}"
+     );
+     assert!(
+-        hint.contains("xai-org-shared/grok-build"),
++        hint.contains(crate::version::GH_RELEASE_REPO),
+         "should name the repo: {hint}"
+     );
+ }
+diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
+index f87df2c7..cb07af0b 100644
+--- a/crates/codegen/xai-grok-update/src/version.rs
++++ b/crates/codegen/xai-grok-update/src/version.rs
+@@ -11,7 +11,11 @@ use xai_grok_shell::util::grok_home::grok_home;
+ 
+ const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
+ const NPM_PACKAGE: &str = "@xai-official/grok";
+-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
++/// GitHub Releases source for `installer = "gh-release"`.
++///
++/// Fork builds point this at the fork so auto-update stays on the
++/// terminal-theme channel instead of the official shared repo.
++pub const GH_RELEASE_REPO: &str = "binaricat/grok-build";
+ 
+ /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching for binaries and origin-respecting no-cache for channel pointers.
+ pub(crate) const CLI_BASE_URL_PRIMARY: &str = "https://x.ai/cli";
+diff --git a/crates/codegen/xai-grok-update/tests/test_subprocess.rs b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+index 4f5fddf7..c9c393ec 100644
+--- a/crates/codegen/xai-grok-update/tests/test_subprocess.rs
++++ b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+@@ -402,7 +402,7 @@ async fn fetch_gh_release_passes_repo_flag() {
+     let log = g.args_log();
+     assert!(log[0].contains("--repo"), "args: {}", log[0]);
+     assert!(
+-        log[0].contains("xai-org-shared/grok-build"),
++        log[0].contains("binaricat/grok-build"),
+         "args: {}",
+         log[0]
+     );
