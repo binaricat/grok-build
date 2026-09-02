@@ -130,7 +130,10 @@ pub fn get_syntect() -> &'static Syntect {
         ThemeKind::GrokNight
         | ThemeKind::RosePineMoon
         | ThemeKind::OscuraMidnight
-        | ThemeKind::Auto => SYNTECT_GROKNIGHT
+        | ThemeKind::Auto
+        // Terminal theme keeps the night tmTheme; near-gray tokens are
+        // remapped to Reset in syntect_to_ratatui_fg (polarity-safe).
+        | ThemeKind::Terminal => SYNTECT_GROKNIGHT
             .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-night.tmTheme"))),
         ThemeKind::TokyoNight => SYNTECT_TOKYONIGHT
             .get_or_init(|| Syntect::new(include_bytes!("../assets/tokyo-night.tmTheme"))),
